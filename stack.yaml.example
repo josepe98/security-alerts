@@ -1,0 +1,34 @@
+# Security Monitor — Stack Definition
+# Copy this file to stack.yaml and fill in your own values.
+# npm and Python packages are scanned dynamically from project_paths;
+# go.sum / Gemfile.lock / composer.lock are also picked up automatically.
+
+platforms:
+  - name: Vercel
+    type: hosting/deployment
+  - name: Supabase
+    type: database/auth/storage
+  - name: GitHub
+    type: version-control
+  - name: GitHub Actions
+    type: ci-cd
+  - name: Cloudflare
+    type: dns/cdn
+  - name: npm Registry
+    type: package-registry
+  - name: PyPI
+    type: package-registry
+
+runtimes:
+  - name: Node.js
+    version: "22"
+  - name: Python
+    version: "3.12"
+  - name: macOS
+    version: "15"
+
+# Paths scanned for lockfiles (package-lock.json, go.sum, Gemfile.lock,
+# composer.lock, requirements.txt, poetry.lock, pyproject.toml)
+project_paths:
+  - ~/your-project-one
+  - ~/your-project-two

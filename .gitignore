@@ -1,0 +1,19 @@
+# Runtime state — contains seen advisory IDs and last-run timestamp
+state.json
+
+# Personal stack definition — lists your project paths and cloud services
+# Copy stack.yaml.example → stack.yaml and fill in your own values
+stack.yaml
+
+# Triage files — per-advisory vulnerability notes specific to your stack
+triage/
+
+# Logs
+security_monitor.log
+
+# LaunchAgent plist — contains personal paths and env var keys
+*.plist
+
+# Python cache
+__pycache__/
+*.pyc
