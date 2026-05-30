@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import smtplib
+import subprocess
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
@@ -970,6 +971,7 @@ Description:
 Produce a JSON object with these fields:
 - "impact_summary": 2-3 sentence plain-English assessment of the real risk to this stack
 - "proposed_action": one clear sentence — "No action required" (with reason) or a specific remediation step
+- "check_commands": list of read-only shell commands that verify whether the system is actually affected right now (e.g. checking installed versions, extension lists, running processes). These will be executed automatically — they must be safe, non-destructive, and produce human-readable output. Empty list if no meaningful check is possible.
 - "upgrade_commands": list of shell commands to remediate, using full paths like ~/canopy/frontend. Empty list if no action needed.
 - "confidence": "HIGH" | "MEDIUM" | "LOW" — confidence in this assessment
 
@@ -993,6 +995,38 @@ Respond with ONLY the JSON object, no other text."""
             "upgrade_commands": [],
             "confidence": "LOW",
         }
+
+
+def run_check_commands(commands: list[str]) -> list[dict]:
+    """
+    Run each read-only check command and return results.
+    Each result: {"command": str, "stdout": str, "stderr": str, "returncode": int}
+    """
+    results = []
+    for cmd in commands:
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env={**os.environ, "HOME": str(Path.home())},
+            )
+            results.append({
+                "command":    cmd,
+                "stdout":     proc.stdout.strip()[:2000],
+                "stderr":     proc.stderr.strip()[:500],
+                "returncode": proc.returncode,
+            })
+            log.info(f"Check command rc={proc.returncode}: {cmd[:60]}")
+        except subprocess.TimeoutExpired:
+            results.append({"command": cmd, "stdout": "", "stderr": "timed out after 15s", "returncode": -1})
+            log.warning(f"Check command timed out: {cmd[:60]}")
+        except Exception as e:
+            results.append({"command": cmd, "stdout": "", "stderr": str(e), "returncode": -1})
+            log.warning(f"Check command failed: {cmd[:60]}: {e}")
+    return results
 
 
 def write_triage_file(adv: Advisory, hits: list[dict], investigation: dict,
@@ -1097,39 +1131,106 @@ def update_recent(new_entries: list[dict]):
     log.info(f"RECENT.md updated ({len(combined)} entries)")
 
 
-def _investigation_html(investigation: dict) -> str:
+def _investigation_html(investigation: dict, check_results: list[dict] | None = None) -> str:
     action   = investigation.get("proposed_action", "—")
     summary  = investigation.get("impact_summary", "")
     cmds     = investigation.get("upgrade_commands", [])
     conf     = investigation.get("confidence", "—")
+
+    checks_html = ""
+    if check_results:
+        rows = ""
+        for r in check_results:
+            output = r["stdout"] or r["stderr"] or "(no output)"
+            rc_color = "#c0392b" if r["returncode"] not in (0, 1) else "#333"
+            rows += (
+                f'<div style="margin:6px 0">'
+                f'<code style="background:#e8e8e8;padding:2px 5px;border-radius:3px">{r["command"]}</code>'
+                f'<pre style="margin:4px 0 0;background:#f8f8f8;padding:8px;border-radius:3px;'
+                f'font-size:12px;overflow-x:auto;color:{rc_color}">{output}</pre>'
+                f'</div>'
+            )
+        checks_html = (
+            f'<p style="margin:8px 0 4px"><strong>✅ Live checks run:</strong></p>'
+            f'{rows}'
+        )
+
     cmd_html = ""
     if cmds:
         cmd_list = "".join(f"<li><code>{c}</code></li>" for c in cmds)
-        cmd_html = f"<p><strong>Commands:</strong></p><ul>{cmd_list}</ul>"
+        cmd_html = f"<p><strong>Remediation commands:</strong></p><ul>{cmd_list}</ul>"
+
     return f"""
 <div style="background:#f0f4ff;border-left:4px solid #3b5bdb;padding:12px 16px;margin:12px 0;border-radius:0 4px 4px 0">
   <p style="margin:0 0 6px"><strong>🔍 Investigation (confidence: {conf})</strong></p>
   <p style="margin:0 0 6px">{summary}</p>
   <p style="margin:0 0 4px"><strong>Proposed action:</strong> {action}</p>
+  {checks_html}
   {cmd_html}
 </div>"""
 
 
+def _is_no_action_needed(adv: Advisory, hits: list[dict]) -> bool:
+    """True when this package advisory has a definitive "you're fine, no action"
+    answer — either the affected package is not installed, or it is installed but
+    every installed version sits outside the affected range.
+
+    Withholds the email in both the "Not installed" and "Not affected" cases, which
+    are the bulk of the inbox noise. Still emails when:
+      - affected_ranges is empty — a service/incident advisory (CISA, GitHub Blog,
+        Bleeping, Krebs) with no version data to clear it; always surfaced.
+      - any installed version is actually exposed (exposed is True).
+      - exposure is uncertain (exposed is None — version parse failed); we fail loud
+        and email rather than silently clearing something we couldn't evaluate.
+
+    Suppressed advisories still get full investigation, live checks, triage files,
+    RECENT.md entries and log lines — only the email is withheld.
+    """
+    if not adv.affected_ranges:
+        return False              # incident/service advisory — no version data to clear it
+    if not hits:
+        return True               # affected package not installed in any scanned project
+    return all(h["exposed"] is False for h in hits)  # installed, but every version is safe
+
+
 def send_alerts(to_notify: list[tuple[Advisory, str, str]],
-                installed: dict[str, dict[str, list[tuple[str, str]]]]):
+                installed: dict[str, dict[str, list[tuple[str, str]]]]) -> tuple[int, int]:
     """
     Send individual emails for CRITICAL/HIGH.
     Batch MEDIUMs into a single digest.
     Subject line is prefixed with ⚠️ EXPOSED when exposure is confirmed.
+
+    Advisories with a definitive no-action verdict (affected package not installed,
+    or installed but on a safe version) are investigated and logged in full but
+    generate no email. Returns (emails_sent, advisories_suppressed).
     """
     critical_high = [(a, r, s) for a, r, s in to_notify if s in ("CRITICAL", "HIGH")]
     medium        = [(a, r, s) for a, r, s in to_notify if s == "MEDIUM"]
     recent_entries: list[dict] = []
+    emails_sent  = 0
+    suppressed   = 0
 
     for adv, reason, severity in critical_high:
         hits          = check_exposure(adv, installed)
         investigation = generate_investigation(adv, hits, reason, severity)
+        check_results = run_check_commands(investigation.get("check_commands", []))
         filename      = write_triage_file(adv, hits, investigation, severity, reason)
+
+        # Triage file + RECENT.md entry are written regardless of whether we email,
+        # so the investigative trail is preserved for every advisory.
+        if filename:
+            recent_entries.append({
+                "date":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "severity": severity,
+                "title":    adv.title,
+                "filename": filename,
+            })
+
+        if _is_no_action_needed(adv, hits):
+            suppressed += 1
+            log.info(f"Email suppressed (no action needed — not installed or not affected): "
+                     f"[{severity}] {adv.id} — {adv.title[:70]}")
+            continue
 
         is_exposed  = any(h["exposed"] is True for h in hits)
         emoji       = SEVERITY_EMOJI.get(severity, "⚪")
@@ -1139,9 +1240,14 @@ def send_alerts(to_notify: list[tuple[Advisory, str, str]],
         inv_text = (f"\n--- Investigation (confidence: {investigation.get('confidence','—')}) ---\n"
                     f"{investigation.get('impact_summary','')}\n\n"
                     f"Proposed action: {investigation.get('proposed_action','—')}\n")
+        if check_results:
+            inv_text += "\nLive checks:\n"
+            for r in check_results:
+                output = r["stdout"] or r["stderr"] or "(no output)"
+                inv_text += f"  $ {r['command']}\n    {output[:300]}\n"
         cmds = investigation.get("upgrade_commands", [])
         if cmds:
-            inv_text += "Commands:\n" + "\n".join(f"  {c}" for c in cmds) + "\n"
+            inv_text += "Remediation commands:\n" + "\n".join(f"  {c}" for c in cmds) + "\n"
 
         triage_html = (f'<p style="background:#f5f5f5;padding:6px 10px;border-radius:3px;'
                        f'font-family:monospace;font-size:13px">📁 Triage: <code>triage/{filename}</code></p>'
@@ -1152,7 +1258,7 @@ def send_alerts(to_notify: list[tuple[Advisory, str, str]],
   <h2 style="color:{SEVERITY_COLOUR.get(severity,'#333')}">Security Alert</h2>
   {_advisory_html(adv, reason, severity, hits)}
   {triage_html}
-  {_investigation_html(investigation)}
+  {_investigation_html(investigation, check_results)}
   <p style="color:#999;font-size:12px;margin-top:32px">Security Monitor · every 60 min</p>
 </body></html>"""
 
@@ -1165,33 +1271,23 @@ def send_alerts(to_notify: list[tuple[Advisory, str, str]],
                 f"Published: {adv.published}\n\n"
                 f"{adv.description}\n\n{adv.url}")
         _send(subject, html, text)
-
-        if filename:
-            recent_entries.append({
-                "date":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "severity": severity,
-                "title":    adv.title,
-                "filename": filename,
-            })
+        emails_sent += 1
 
     if medium:
         any_exposed     = False
         bodies          = []
         text_parts      = []
         triage_filenames: list[str] = []
+        included = 0
         for adv, reason, severity in medium:
             hits          = check_exposure(adv, installed)
             investigation = generate_investigation(adv, hits, reason, severity)
+            check_results = run_check_commands(investigation.get("check_commands", []))
             filename      = write_triage_file(adv, hits, investigation, severity, reason)
-            if any(h["exposed"] is True for h in hits):
-                any_exposed = True
-            bodies.append(_advisory_html(adv, reason, severity, hits))
-            text_parts.append(
-                f"[MEDIUM] {adv.source}: {adv.title}\n"
-                f"{_exposure_text(hits, source=adv.source, has_ranges=bool(adv.affected_ranges))}\nWhy: {reason}\n{adv.url}"
-            )
+
+            # Triage file + RECENT.md entry are recorded for every advisory, even
+            # those whose email we suppress, so the investigative trail is preserved.
             if filename:
-                triage_filenames.append(filename)
                 recent_entries.append({
                     "date":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
                     "severity": severity,
@@ -1199,29 +1295,54 @@ def send_alerts(to_notify: list[tuple[Advisory, str, str]],
                     "filename": filename,
                 })
 
-        exposed_tag = "⚠️ EXPOSED · " if any_exposed else ""
-        subject = (f"{exposed_tag}🟡 [MEDIUM] "
-                   f"{len(medium)} security advisory{'s' if len(medium) > 1 else ''} — action may be needed")
+            if _is_no_action_needed(adv, hits):
+                suppressed += 1
+                log.info(f"Digest entry suppressed (no action needed — not installed or not affected): "
+                         f"[{severity}] {adv.id} — {adv.title[:70]}")
+                continue
 
-        triage_list_html = ""
-        if triage_filenames:
-            items = "".join(f"<li><code>triage/{f}</code></li>" for f in triage_filenames)
-            triage_list_html = (f'<p style="background:#f5f5f5;padding:6px 10px;border-radius:3px;'
-                                f'font-family:monospace;font-size:13px">📁 Triage files:<ul style="margin:4px 0">'
-                                f'{items}</ul></p>')
-        triage_list_text = ("\nTriage files:\n" + "\n".join(f"  triage/{f}" for f in triage_filenames) + "\n"
-                            ) if triage_filenames else ""
+            included += 1
+            if any(h["exposed"] is True for h in hits):
+                any_exposed = True
+            bodies.append(_advisory_html(adv, reason, severity, hits) +
+                          _investigation_html(investigation, check_results))
+            text_parts.append(
+                f"[MEDIUM] {adv.source}: {adv.title}\n"
+                f"{_exposure_text(hits, source=adv.source, has_ranges=bool(adv.affected_ranges))}\nWhy: {reason}\n{adv.url}"
+            )
+            if filename:
+                triage_filenames.append(filename)
 
-        html = f"""<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:700px;margin:0 auto;padding:20px">
+        # If every MEDIUM advisory was a not-installed/no-action case, send nothing.
+        if not bodies:
+            log.info("MEDIUM digest skipped — all advisories were no-action (not installed / not affected).")
+        else:
+            exposed_tag = "⚠️ EXPOSED · " if any_exposed else ""
+            subject = (f"{exposed_tag}🟡 [MEDIUM] "
+                       f"{included} security advisory{'s' if included > 1 else ''} — action may be needed")
+
+            triage_list_html = ""
+            if triage_filenames:
+                items = "".join(f"<li><code>triage/{f}</code></li>" for f in triage_filenames)
+                triage_list_html = (f'<p style="background:#f5f5f5;padding:6px 10px;border-radius:3px;'
+                                    f'font-family:monospace;font-size:13px">📁 Triage files:<ul style="margin:4px 0">'
+                                    f'{items}</ul></p>')
+            triage_list_text = ("\nTriage files:\n" + "\n".join(f"  triage/{f}" for f in triage_filenames) + "\n"
+                                ) if triage_filenames else ""
+
+            html = f"""<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:700px;margin:0 auto;padding:20px">
   <h2 style="color:{SEVERITY_COLOUR['MEDIUM']}">Medium Severity Digest</h2>
   {"".join(bodies)}
   {triage_list_html}
   <p style="color:#999;font-size:12px;margin-top:32px">Security Monitor · every 60 min</p>
 </body></html>"""
-        _send(subject, html, "\n\n---\n\n".join(text_parts) + triage_list_text)
+            _send(subject, html, "\n\n---\n\n".join(text_parts) + triage_list_text)
+            emails_sent += 1
 
     if recent_entries:
         update_recent(recent_entries)
+
+    return emails_sent, suppressed
 
 
 def _send(subject: str, body_html: str, body_text: str):
@@ -1340,9 +1461,11 @@ def main():
             to_notify = [(a, r, s) for a, r, s in relevant if SEVERITY_RANK.get(s, 0) >= 2]
 
     # ── Notify ─────────────────────────────────────────────────────────────────
+    emails_sent = 0
+    suppressed  = 0
     if to_notify:
-        log.info(f"Sending alerts for {len(to_notify)} relevant advisories...")
-        send_alerts(to_notify, installed)
+        log.info(f"Processing {len(to_notify)} relevant advisories...")
+        emails_sent, suppressed = send_alerts(to_notify, installed)
     else:
         log.info("No relevant alerts this run.")
 
@@ -1350,7 +1473,9 @@ def main():
     state["seen_ids"] = list(seen_ids)
     save_state(state)
 
-    log.info(f"=== Run complete. {len(to_notify)} alert(s) sent. ===\n")
+    log.info(f"=== Run complete. {emails_sent} email(s) sent, "
+             f"{suppressed} suppressed (no action — not installed / not affected). "
+             f"{len(to_notify)} relevant advisories investigated. ===\n")
 
 
 if __name__ == "__main__":
