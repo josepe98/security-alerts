@@ -17,3 +17,8 @@ security_monitor.log
 # Python cache
 __pycache__/
 *.pyc
+
+# Local env files — never commit (ADM-041)
+.env
+.env.local
+.env.*.local
