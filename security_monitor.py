@@ -434,6 +434,12 @@ def check_exposure(advisory: Advisory,
         if eco == "go":
             specifier = re.sub(r'\bv(\d+\.\d+)', r'\1', specifier)
 
+        # GitHub's vulnerable_version_range uses a bare "=" for exact matches
+        # (e.g. "= 3.4.4"), which is NOT valid PEP 440 — packaging needs "==".
+        # Normalize any token-initial single "=" to "==" so SpecifierSet parses
+        # it instead of raising InvalidSpecifier (which silently voids the check).
+        specifier = re.sub(r'(?<![<>=!])=(?!=)', '==', specifier)
+
         installed_entries = installed.get(eco, {}).get(name, [])
         if not installed_entries:
             continue  # package not installed in any project
@@ -661,7 +667,7 @@ def fetch_github_advisories(since: datetime | None) -> list[Advisory]:
                     affected_ranges.append({
                         "ecosystem": eco,
                         "name":      pkg_name,
-                        "specifier": version_range,  # GitHub uses packaging notation already
+                        "specifier": version_range,  # close to packaging notation; check_exposure normalizes bare "=" → "=="
                         "fixed":     fixed_ver,
                     })
 
@@ -944,11 +950,17 @@ def generate_investigation(adv: Advisory, hits: list[dict],
     """
     exposed     = [h for h in hits if h["exposed"] is True]
     not_exposed = [h for h in hits if h["exposed"] is False]
+    uncertain   = [h for h in hits if h["exposed"] is None]
 
     if exposed:
         exposure_summary = "EXPOSED: " + "; ".join(
             f"{h['pkg']}@{h['version']} in {h['project']} (fix: {h['fix'] or 'unknown'})"
             for h in exposed
+        )
+    elif uncertain:
+        exposure_summary = "UNCERTAIN — package installed but version could NOT be compared (treat as possibly affected, do NOT assume safe): " + "; ".join(
+            f"{h['pkg']}@{h['version']} in {h['project']} (fix if affected: {h['fix'] or 'unknown'})"
+            for h in uncertain
         )
     elif not_exposed:
         exposure_summary = "Not exposed: " + "; ".join(
@@ -958,6 +970,27 @@ def generate_investigation(adv: Advisory, hits: list[dict],
     else:
         exposure_summary = "No installed packages matched the affected range."
 
+    # Resolve each installed match to its real project root so the model targets
+    # the ACTUAL install location instead of guessing a plausible project.
+    try:
+        stack_cfg = yaml.safe_load(STACK_FILE.read_text())
+        path_by_name = {
+            Path(p).expanduser().name: str(Path(p).expanduser())
+            for p in stack_cfg.get("project_paths", [])
+        }
+    except Exception:
+        path_by_name = {}
+
+    all_hits = exposed + uncertain + not_exposed
+    if all_hits:
+        installed_locations = "\n".join(
+            f"- {h['pkg']}@{h['version']} found in project '{h['project']}' "
+            f"(root: {path_by_name.get(h['project'], '~/' + h['project'])})"
+            for h in all_hits
+        )
+    else:
+        installed_locations = "(none — the scan found no copy of the affected package in any project_path)"
+
     prompt = f"""Advisory: [{severity}] {adv.source}: {adv.title}
 URL: {adv.url}
 Published: {adv.published}
@@ -965,14 +998,17 @@ Affected packages: {', '.join(adv.packages[:10]) or '—'}
 Relevance reason: {reason}
 Exposure check: {exposure_summary}
 
+Installed locations (authoritative — from the dependency scan, NOT a guess):
+{installed_locations}
+
 Description:
 {adv.description[:1500]}
 
 Produce a JSON object with these fields:
 - "impact_summary": 2-3 sentence plain-English assessment of the real risk to this stack
 - "proposed_action": one clear sentence — "No action required" (with reason) or a specific remediation step
-- "check_commands": list of read-only shell commands that verify whether the system is actually affected right now (e.g. checking installed versions, extension lists, running processes). These will be executed automatically — they must be safe, non-destructive, and produce human-readable output. Empty list if no meaningful check is possible.
-- "upgrade_commands": list of shell commands to remediate, using full paths like ~/canopy/frontend. Empty list if no action needed.
+- "check_commands": list of read-only shell commands that verify whether the system is actually affected right now. CRITICAL: target ONLY the project roots listed under "Installed locations" above — do NOT invent or guess other projects. If Installed locations is "(none)", the package was not found by the scan, so prefer an empty list over guessing where it might be. Commands run automatically and must be safe, non-destructive, and human-readable. Empty list if no meaningful check is possible.
+- "upgrade_commands": list of shell commands to remediate, using the full project roots from "Installed locations" above. Empty list if no action needed.
 - "confidence": "HIGH" | "MEDIUM" | "LOW" — confidence in this assessment
 
 Respond with ONLY the JSON object, no other text."""
@@ -1044,12 +1080,23 @@ def write_triage_file(adv: Advisory, hits: list[dict], investigation: dict,
 
     exposed     = [h for h in hits if h["exposed"] is True]
     not_exposed = [h for h in hits if h["exposed"] is False]
+    uncertain   = [h for h in hits if h["exposed"] is None]
 
     if exposed:
         status = "⚠️ Exposed"
         exposure_md = "\n".join(
             f"- `{h['pkg']}@{h['version']}` in **{h['project']}** — fix: `{h['fix'] or 'unknown'}`"
             for h in exposed
+        )
+    elif uncertain:
+        # Package IS installed but its version could not be compared against the
+        # affected range (e.g. unparseable specifier). This is UNKNOWN, not safe —
+        # surface it loudly rather than silently treating it as "not installed".
+        status = "❓ Exposure uncertain — MANUAL REVIEW"
+        exposure_md = "\n".join(
+            f"- `{h['pkg']}@{h['version']}` in **{h['project']}** — installed, but version "
+            f"could not be compared against the affected range (fix if affected: `{h['fix'] or 'unknown'}`)"
+            for h in uncertain
         )
     elif not_exposed:
         status = "✅ Not affected"
