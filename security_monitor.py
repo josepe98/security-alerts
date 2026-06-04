@@ -1143,6 +1143,10 @@ def write_triage_file(adv: Advisory, hits: list[dict], investigation: dict,
 
 {reason}
 
+## Resolution
+
+_No action taken yet._
+
 ## References
 
 {refs}"""
