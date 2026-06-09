@@ -86,13 +86,24 @@ _MCP_CONFIG_FILENAMES: frozenset[str] = frozenset({
     "mcp_settings.json", "cline_mcp_settings.json", ".mcp.json",
 })
 
+# Path fragments that mark plugin marketplace caches and bundled template
+# configs rather than servers the user actually connected. Without these,
+# every server named in a never-installed plugin manifest (servicenow,
+# zoominfo, benchling, ...) gets reported as part of the stack (see
+# triage/bc_..._servicenow.md for the false positive this caused).
+_MCP_IGNORED_PATH_PARTS: frozenset[str] = frozenset({
+    "cowork_plugins", "local-agent-mode-sessions", "marketplaces",
+    "cache", "configs", "node_modules",
+})
+
 
 def scan_mcp_configs() -> list[str]:
     """Scan known MCP config file locations and return a sorted list of server IDs.
 
     Looks in ~/.config, ~/Library/Application Support, and ~/.claude for any of
     the well-known MCP config filenames. Ported from Perplexity's bumblebee
-    (internal/ecosystem/mcp/mcp.go).
+    (internal/ecosystem/mcp/mcp.go). Skips plugin marketplace caches and
+    template configs, which describe installable servers, not configured ones.
     """
     server_ids: set[str] = set()
     search_roots = [
@@ -105,6 +116,8 @@ def scan_mcp_configs() -> list[str]:
             continue
         for config_name in _MCP_CONFIG_FILENAMES:
             for config_file in root.rglob(config_name):
+                if _MCP_IGNORED_PATH_PARTS.intersection(config_file.parts):
+                    continue
                 try:
                     data = json.loads(config_file.read_text())
                     servers = data.get("mcpServers", data.get("servers", {}))
