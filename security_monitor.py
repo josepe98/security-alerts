@@ -255,10 +255,27 @@ def build_stack_context(installed: dict | None = None) -> str:
 _GEMFILE_SPEC_RE = re.compile(r'^    ([A-Za-z0-9_.\-]+)\s+\(([^)]+)\)')
 
 
-def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
+def _install_location(project: Path, project_name: str, dep_file: Path) -> tuple[str, str]:
+    """
+    Resolve the directory that owns a dependency file to (label, abs_path).
+
+    label is the project name plus the sub-path when the file lives in a nested
+    sub-project (e.g. "canopy/frontend" for canopy/frontend/package-lock.json).
+    abs_path is the install directory remediation commands must target — a
+    `npm install` at the project root would patch the wrong tree.
+    """
+    install_dir = dep_file.parent
+    rel = install_dir.relative_to(project)
+    label = project_name if rel == Path(".") else f"{project_name}/{rel.as_posix()}"
+    return label, str(install_dir)
+
+
+def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str, str]]]]:
     """
     Scan lock files across all project_paths for every supported ecosystem.
-    Returns: {"npm": {"axios": [("1.4.0", "canopy"), ...]},
+    Each entry is (version, location_label, install_dir) where install_dir is
+    the directory owning the lock file — not necessarily the project root.
+    Returns: {"npm": {"axios": [("1.4.0", "canopy/frontend", "/Users/erik/canopy/frontend"), ...]},
               "pypi": ..., "go": ..., "rubygems": ..., "composer": ...}
 
     Ecosystem scanners ported from Perplexity's bumblebee open-source scanner:
@@ -267,7 +284,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
       rubygems  — Gemfile.lock spec-block parsing (bumblebee: internal/ecosystem/rubygems)
       composer  — composer.lock JSON parsing (bumblebee: internal/ecosystem/composer)
     """
-    result: dict[str, dict[str, list[tuple[str, str]]]] = {
+    result: dict[str, dict[str, list[tuple[str, str, str]]]] = {
         "npm": {}, "pypi": {}, "go": {}, "rubygems": {}, "composer": {},
     }
     stack_cfg = yaml.safe_load(STACK_FILE.read_text())
@@ -282,6 +299,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
         for lock_file in project.rglob("package-lock.json"):
             if ".claude" in lock_file.parts or "node_modules" in lock_file.parts:
                 continue
+            label, install_dir = _install_location(project, project_name, lock_file)
             try:
                 data = json.loads(lock_file.read_text())
                 lock_ver = data.get("lockfileVersion", 1)
@@ -295,14 +313,14 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
                         pkg_name = key.removeprefix("node_modules/").lower()
                         version  = val.get("version", "")
                         if pkg_name and version:
-                            result["npm"].setdefault(pkg_name, []).append((version, project_name))
+                            result["npm"].setdefault(pkg_name, []).append((version, label, install_dir))
                 else:
                     # v1: flat dependencies dict (may be nested)
                     def _collect_v1(deps: dict) -> None:
                         for pkg, info in deps.items():
                             version = info.get("version", "")
                             if version:
-                                result["npm"].setdefault(pkg.lower(), []).append((version, project_name))
+                                result["npm"].setdefault(pkg.lower(), []).append((version, label, install_dir))
                             if "dependencies" in info:
                                 _collect_v1(info["dependencies"])
                     _collect_v1(data.get("dependencies", {}))
@@ -313,6 +331,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
         for req_file in project.rglob("requirements.txt"):
             if ".claude" in req_file.parts:
                 continue
+            label, install_dir = _install_location(project, project_name, req_file)
             try:
                 for line in req_file.read_text().splitlines():
                     line = line.strip()
@@ -322,7 +341,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
                     pkg_name = parts[0].split("[")[0].strip().lower()
                     version  = parts[1].split(";")[0].strip()
                     if pkg_name and version:
-                        result["pypi"].setdefault(pkg_name, []).append((version, project_name))
+                        result["pypi"].setdefault(pkg_name, []).append((version, label, install_dir))
             except Exception as e:
                 log.warning(f"Failed to parse {req_file}: {e}")
 
@@ -330,6 +349,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
         for poetry_lock in project.rglob("poetry.lock"):
             if ".claude" in poetry_lock.parts:
                 continue
+            label, install_dir = _install_location(project, project_name, poetry_lock)
             try:
                 content = poetry_lock.read_text()
                 for block in re.split(r'\[\[package\]\]', content)[1:]:
@@ -338,7 +358,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
                     if name_m and ver_m:
                         pkg_name = name_m.group(1).lower()
                         version  = ver_m.group(1)
-                        result["pypi"].setdefault(pkg_name, []).append((version, project_name))
+                        result["pypi"].setdefault(pkg_name, []).append((version, label, install_dir))
             except Exception as e:
                 log.warning(f"Failed to parse {poetry_lock}: {e}")
 
@@ -348,6 +368,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
         for go_sum in project.rglob("go.sum"):
             if ".claude" in go_sum.parts:
                 continue
+            label, install_dir = _install_location(project, project_name, go_sum)
             try:
                 for line in go_sum.read_text().splitlines():
                     parts = line.split()
@@ -358,7 +379,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
                     # Skip the "module v1.2.3/go.mod" pseudo-entries
                     if "/go.mod" in version:
                         continue
-                    result["go"].setdefault(module, []).append((version, project_name))
+                    result["go"].setdefault(module, []).append((version, label, install_dir))
             except Exception as e:
                 log.warning(f"Failed to parse {go_sum}: {e}")
 
@@ -367,6 +388,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
         for gemfile_lock in project.rglob("Gemfile.lock"):
             if ".claude" in gemfile_lock.parts:
                 continue
+            label, install_dir = _install_location(project, project_name, gemfile_lock)
             try:
                 in_specs = False
                 for line in gemfile_lock.read_text().splitlines():
@@ -380,7 +402,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
                         m = _GEMFILE_SPEC_RE.match(line)
                         if m:
                             result["rubygems"].setdefault(m.group(1).lower(), []).append(
-                                (m.group(2), project_name))
+                                (m.group(2), label, install_dir))
             except Exception as e:
                 log.warning(f"Failed to parse {gemfile_lock}: {e}")
 
@@ -389,6 +411,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
         for composer_lock in project.rglob("composer.lock"):
             if ".claude" in composer_lock.parts:
                 continue
+            label, install_dir = _install_location(project, project_name, composer_lock)
             try:
                 data = json.loads(composer_lock.read_text())
                 for section in ("packages", "packages-dev"):
@@ -396,7 +419,7 @@ def build_installed_versions() -> dict[str, dict[str, list[tuple[str, str]]]]:
                         name    = pkg.get("name", "").lower()
                         version = pkg.get("version", "")
                         if name and version:
-                            result["composer"].setdefault(name, []).append((version, project_name))
+                            result["composer"].setdefault(name, []).append((version, label, install_dir))
             except Exception as e:
                 log.warning(f"Failed to parse {composer_lock}: {e}")
 
@@ -426,11 +449,13 @@ class Advisory:
 
 # ── Exposure checking ─────────────────────────────────────────────────────────
 def check_exposure(advisory: Advisory,
-                   installed: dict[str, dict[str, list[tuple[str, str]]]]
+                   installed: dict[str, dict[str, list[tuple[str, str, str]]]]
                    ) -> list[dict]:
     """
     Compare this advisory's affected_ranges against installed package versions.
-    Returns list of hits: {"pkg", "version", "project", "fix", "exposed"}
+    Returns list of hits: {"pkg", "version", "project", "path", "fix", "exposed"}
+    project is the location label (e.g. "canopy/frontend"); path is the absolute
+    install directory owning the lock file.
     exposed = True | False | None (None = version parse failed)
     """
     hits = []
@@ -462,11 +487,11 @@ def check_exposure(advisory: Advisory,
         except InvalidSpecifier:
             spec_set = None
 
-        for version_str, project in installed_entries:
+        for version_str, project, path in installed_entries:
             # Strip Go "v" prefix from installed version strings before comparison
             if eco == "go" and version_str.startswith("v"):
                 version_str = version_str[1:]
-            key = (name, version_str, project)
+            key = (name, version_str, path)
             if key in seen:
                 continue
             seen.add(key)
@@ -479,7 +504,8 @@ def check_exposure(advisory: Advisory,
                     pass
 
             hits.append({"pkg": name, "version": version_str,
-                         "project": project, "fix": fix, "exposed": exposed})
+                         "project": project, "path": path,
+                         "fix": fix, "exposed": exposed})
 
     return hits
 
@@ -702,7 +728,7 @@ def fetch_github_advisories(since: datetime | None) -> list[Advisory]:
     return advisories
 
 
-def fetch_osv(installed: dict[str, dict[str, list[tuple[str, str]]]]) -> list[Advisory]:
+def fetch_osv(installed: dict[str, dict[str, list[tuple[str, str, str]]]]) -> list[Advisory]:
     """Batch-query OSV for all packages in the stack across all tracked ecosystems."""
     queries = []
     for eco_key, osv_eco in INTERNAL_TO_OSV_ECO.items():
@@ -983,22 +1009,14 @@ def generate_investigation(adv: Advisory, hits: list[dict],
     else:
         exposure_summary = "No installed packages matched the affected range."
 
-    # Resolve each installed match to its real project root so the model targets
-    # the ACTUAL install location instead of guessing a plausible project.
-    try:
-        stack_cfg = yaml.safe_load(STACK_FILE.read_text())
-        path_by_name = {
-            Path(p).expanduser().name: str(Path(p).expanduser())
-            for p in stack_cfg.get("project_paths", [])
-        }
-    except Exception:
-        path_by_name = {}
-
+    # Each hit carries the directory that owns its lock file, so the model
+    # targets the ACTUAL install location — which for nested sub-projects
+    # (e.g. canopy/frontend) is NOT the project root.
     all_hits = exposed + uncertain + not_exposed
     if all_hits:
         installed_locations = "\n".join(
-            f"- {h['pkg']}@{h['version']} found in project '{h['project']}' "
-            f"(root: {path_by_name.get(h['project'], '~/' + h['project'])})"
+            f"- {h['pkg']}@{h['version']} found in '{h['project']}' "
+            f"(install dir: {h['path']})"
             for h in all_hits
         )
     else:
@@ -1020,8 +1038,8 @@ Description:
 Produce a JSON object with these fields:
 - "impact_summary": 2-3 sentence plain-English assessment of the real risk to this stack
 - "proposed_action": one clear sentence — "No action required" (with reason) or a specific remediation step
-- "check_commands": list of read-only shell commands that verify whether the system is actually affected right now. CRITICAL: target ONLY the project roots listed under "Installed locations" above — do NOT invent or guess other projects. If Installed locations is "(none)", the package was not found by the scan, so prefer an empty list over guessing where it might be. Commands run automatically and must be safe, non-destructive, and human-readable. Empty list if no meaningful check is possible.
-- "upgrade_commands": list of shell commands to remediate, using the full project roots from "Installed locations" above. Empty list if no action needed.
+- "check_commands": list of read-only shell commands that verify whether the system is actually affected right now. CRITICAL: target ONLY the install dirs listed under "Installed locations" above — do NOT invent or guess other locations, and do NOT substitute a parent/project root for a nested install dir. If Installed locations is "(none)", the package was not found by the scan, so prefer an empty list over guessing where it might be. Commands run automatically and must be safe, non-destructive, and human-readable. Empty list if no meaningful check is possible.
+- "upgrade_commands": list of shell commands to remediate, using the exact full install dirs from "Installed locations" above (e.g. `cd <install dir> && ...`). Empty list if no action needed.
 - "confidence": "HIGH" | "MEDIUM" | "LOW" — confidence in this assessment
 
 Respond with ONLY the JSON object, no other text."""
@@ -1098,7 +1116,7 @@ def write_triage_file(adv: Advisory, hits: list[dict], investigation: dict,
     if exposed:
         status = "⚠️ Exposed"
         exposure_md = "\n".join(
-            f"- `{h['pkg']}@{h['version']}` in **{h['project']}** — fix: `{h['fix'] or 'unknown'}`"
+            f"- `{h['pkg']}@{h['version']}` in **{h['project']}** (`{h['path']}`) — fix: `{h['fix'] or 'unknown'}`"
             for h in exposed
         )
     elif uncertain:
@@ -1107,7 +1125,7 @@ def write_triage_file(adv: Advisory, hits: list[dict], investigation: dict,
         # surface it loudly rather than silently treating it as "not installed".
         status = "❓ Exposure uncertain — MANUAL REVIEW"
         exposure_md = "\n".join(
-            f"- `{h['pkg']}@{h['version']}` in **{h['project']}** — installed, but version "
+            f"- `{h['pkg']}@{h['version']}` in **{h['project']}** (`{h['path']}`) — installed, but version "
             f"could not be compared against the affected range (fix if affected: `{h['fix'] or 'unknown'}`)"
             for h in uncertain
         )
@@ -1258,7 +1276,7 @@ def _is_no_action_needed(adv: Advisory, hits: list[dict]) -> bool:
 
 
 def send_alerts(to_notify: list[tuple[Advisory, str, str]],
-                installed: dict[str, dict[str, list[tuple[str, str]]]]) -> tuple[int, int]:
+                installed: dict[str, dict[str, list[tuple[str, str, str]]]]) -> tuple[int, int]:
     """
     Send individual emails for CRITICAL/HIGH.
     Batch MEDIUMs into a single digest.
