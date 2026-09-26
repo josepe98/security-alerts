@@ -96,23 +96,40 @@ _MCP_IGNORED_PATH_PARTS: frozenset[str] = frozenset({
     "cache", "configs", "node_modules",
 })
 
+# App folders under ~/Library/Application Support that can hold MCP configs.
+# Listed explicitly rather than walking all of Application Support: recursing
+# into other apps' data trips macOS's "access data from other apps" block,
+# and the blocked folders were silently skipped. Add new MCP clients here.
+_MCP_APP_SUPPORT_DIRS: tuple[str, ...] = (
+    "Claude", "Claude-3p", "fastmcp", "Zed",
+    "Code/User", "Code - Insiders/User", "Cursor/User", "Windsurf/User",
+)
+
 
 def scan_mcp_configs() -> list[str]:
     """Scan known MCP config file locations and return a sorted list of server IDs.
 
-    Looks in ~/.config, ~/Library/Application Support, and ~/.claude for any of
-    the well-known MCP config filenames. Ported from Perplexity's bumblebee
+    Looks in ~/.config, ~/.claude, and the known MCP client folders under
+    ~/Library/Application Support (_MCP_APP_SUPPORT_DIRS) for any of the
+    well-known MCP config filenames. Ported from Perplexity's bumblebee
     (internal/ecosystem/mcp/mcp.go). Skips plugin marketplace caches and
     template configs, which describe installable servers, not configured ones.
     """
     server_ids: set[str] = set()
+    app_support = Path.home() / "Library" / "Application Support"
     search_roots = [
         Path.home() / ".config",
-        Path.home() / "Library" / "Application Support",
         Path.home() / ".claude",
+        *(app_support / d for d in _MCP_APP_SUPPORT_DIRS),
     ]
     for root in search_roots:
         if not root.exists():
+            continue
+        # rglob silently skips directories it can't read, so probe first.
+        try:
+            os.listdir(root)
+        except OSError as e:
+            log.warning(f"MCP scan: cannot read {root} ({e}); its servers will be missing")
             continue
         for config_name in _MCP_CONFIG_FILENAMES:
             for config_file in root.rglob(config_name):
@@ -123,8 +140,8 @@ def scan_mcp_configs() -> list[str]:
                     servers = data.get("mcpServers", data.get("servers", {}))
                     if isinstance(servers, dict):
                         server_ids.update(servers.keys())
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"MCP scan: could not parse {config_file}: {e}")
     return sorted(server_ids)
 
 
